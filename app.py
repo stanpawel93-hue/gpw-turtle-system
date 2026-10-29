@@ -1,9 +1,11 @@
 """
 System Transakcyjny Żółwi (Turtle Trading System) dla GPW i NewConnect
-Aplikacja Streamlit do skanowania sygnałów dziennych oraz backtestu historycznego.
+Aplikacja Streamlit do zarządzania portfelem, automatycznego wykrywania trwających trendów,
+skanowania wyłącznie świeżych wejść dla rynku oraz piramidowania/sprzedaży dla portfela.
 """
 
 import os
+import json
 from datetime import datetime, date
 import streamlit as st
 import pandas as pd
@@ -15,8 +17,6 @@ from plotly.subplots import make_subplots
 try:
     from gpw_tickers import GPW_TICKERS, get_ticker_list, get_ticker_info
 except ImportError:
-    # Wbudowany kompletny fallback głównych spółek GPW i NewConnect,
-    # aby app.py działał nawet jeśli plik gpw_tickers.py nie został skopiowany
     GPW_TICKERS = {
         "PKN.WA": {"name": "Orlen", "index": "WIG20", "sector": "Paliwa i Energetyka"},
         "PKO.WA": {"name": "PKO Bank Polski", "index": "WIG20", "sector": "Bankowość"},
@@ -77,14 +77,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Bezpieczny rerun kompatybilny z każdą wersją Streamlit
 def safe_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
 
-# Stylizacja CSS dla kart wskaźników
 st.markdown("""
 <style>
     .metric-card {
@@ -94,19 +92,15 @@ st.markdown("""
         color: white;
         border: 1px solid #334155;
     }
-    .metric-value {
-        font-size: 24px;
-        font-weight: 700;
-        margin-top: 4px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-# Katalog cache dla danych historycznych
 CACHE_DIR = "cache_data"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Dekorator cache kompatybilny wstecznie
+PORTFOLIO_FILE = os.path.join(CACHE_DIR, "user_portfolio.json")
+HISTORY_FILE = os.path.join(CACHE_DIR, "portfolio_history.json")
+
 def get_cache_decorator():
     if hasattr(st, "cache_data"):
         return st.cache_data(ttl=3600 * 6, show_spinner=False)
@@ -118,17 +112,47 @@ def get_cache_decorator():
         return noop
 
 # ==========================================
+# ZARZĄDZANIE TRWAŁYM PORTFELEM (JSON)
+# ==========================================
+def load_portfolio():
+    if os.path.exists(PORTFOLIO_FILE):
+        try:
+            with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_portfolio(positions):
+    try:
+        with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+            json.dump(positions, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_closed_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_closed_history(history):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ==========================================
 # FUNKCJE POBIERANIA I CACHOWANIA DANYCH
 # ==========================================
 @get_cache_decorator()
 def fetch_ticker_data(symbol: str, start_date: str = "2015-01-01") -> pd.DataFrame:
-    """
-    Pobiera dane dzienne OHLCV z Yahoo Finance od wybranej daty.
-    Zapisuje i odczytuje lokalny cache Parquet dla maksymalnej szybkości.
-    """
     cache_file = os.path.join(CACHE_DIR, f"{symbol.replace('.', '_')}.parquet")
-    
-    # Odczytanie z trwałego cache lokalnego Parquet na dysku
     if os.path.exists(cache_file):
         try:
             df = pd.read_parquet(cache_file)
@@ -138,36 +162,26 @@ def fetch_ticker_data(symbol: str, start_date: str = "2015-01-01") -> pd.DataFra
             pass
 
     try:
-        # Pobieranie z yfinance
         df = yf.download(symbol, start=start_date, progress=False, auto_adjust=False)
         if df.empty:
             return pd.DataFrame()
 
-        # Obsługa wielopoziomowych kolumn yfinance (MultiIndex)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # Standaryzacja kolumn
         df = df.rename(columns={
-            "Open": "Open",
-            "High": "High",
-            "Low": "Low",
-            "Close": "Close",
-            "Volume": "Volume"
+            "Open": "Open", "High": "High", "Low": "Low", "Close": "Close", "Volume": "Volume"
         })
-        
-        # Filtrujemy niepotrzebne i brakujące wiersze
         df = df.dropna(subset=["Close", "High", "Low", "Volume"])
         df = df[df["Volume"] >= 0]
         
-        # Zapis do cache Parquet
         try:
             df.to_parquet(cache_file)
         except Exception:
             pass
 
         return df
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
 
@@ -175,40 +189,25 @@ def fetch_ticker_data(symbol: str, start_date: str = "2015-01-01") -> pd.DataFra
 # MATEMATYKA STRATEGII ŻÓŁWI (TURTLE)
 # ==========================================
 def calculate_indicators(df: pd.DataFrame, entry_period: int = 20, exit_period: int = 10, atr_period: int = 20):
-    """
-    Wylicza wskaźniki Turtle:
-    1. True Range (TR) i ATR (N)
-    2. Kanał Donchiana Górny (Entry) z wyłączeniem bieżącej świecy
-    3. Kanał Donchiana Dolny (Exit) z wyłączeniem bieżącej świecy
-    4. Średni obrót dzienny (Turnover) = Close * Volume
-    """
     data = df.copy()
-    
-    # 1. True Range
     prev_close = data["Close"].shift(1)
     hl = data["High"] - data["Low"]
     hc = (data["High"] - prev_close).abs()
     lc = (data["Low"] - prev_close).abs()
     data["TR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    
-    # 2. ATR (N) - średnia ruchoma krocząca z TR
     data["ATR"] = data["TR"].rolling(window=atr_period, min_periods=1).mean()
-    
-    # 3. Kanały Donchiana (shift(1) chroni przed lookahead bias w analizie dziennej)
     data["Donchian_High"] = data["High"].shift(1).rolling(window=entry_period).max()
     data["Donchian_Low"] = data["Low"].shift(1).rolling(window=exit_period).min()
-    
-    # 4. Obrót dzienny i średni obrót
     data["Daily_Turnover"] = data["Close"] * data["Volume"]
-    
     return data
 
 
 def calculate_turtle_unit_size(capital: float, risk_pct: float, atr: float, price: float) -> int:
     """
-    Oblicza wielkość pozycji wg reguły Żółwi:
-    Ryzyko kwotowe = Kapitał * (Procent Ryzyka / 100)
-    Unit Size = floor(Ryzyko kwotowe / ATR)
+    Tradycyjny model kalkulacji jednostki Żółwi (Classic Turtle Unit Size):
+    Cash at risk = Kapitał * (RiskPct / 100) (zazwyczaj 1% kapitału portfela)
+    Zmienność na akcję N = ATR
+    Unit Size = floor(Cash at risk / ATR)
     """
     if atr <= 0 or price <= 0 or capital <= 0:
         return 0
@@ -218,34 +217,155 @@ def calculate_turtle_unit_size(capital: float, risk_pct: float, atr: float, pric
     return max(0, min(raw_units, max_affordable))
 
 
+def find_active_turtle_trends(tickers, entry_period=20, exit_period=10, atr_period=20, min_turnover=100000, turnover_days=60, progress_cb=None):
+    """
+    Sprawdza, które spółki wybiły górny kanał Donchiana (20d) i od tamtej pory NIE wybiły dołka (10d) ani Stop Lossa (2xN).
+    Wejście następuje kolejnego dnia po cenie otwarcia (Open T+1).
+    Zwraca listę pozycji, które zgodnie z regułami Żółwi POWINNY ZNAJDOWAĆ SIĘ DZIŚ W PORTFELU.
+    """
+    active_trends = []
+    total = len(tickers)
+    for idx, sym in enumerate(tickers):
+        if progress_cb:
+            progress_cb(idx + 1, total, f"Badanie trendu {sym} ({idx+1}/{total})...")
+        df = fetch_ticker_data(sym, start_date="2023-01-01")
+        if df.empty or len(df) < max(entry_period, exit_period, turnover_days) + 10:
+            continue
+        recent_turnover = (df["Close"] * df["Volume"]).tail(turnover_days).mean()
+        if recent_turnover < min_turnover:
+            continue
+        calc = calculate_indicators(df, entry_period=entry_period, exit_period=exit_period, atr_period=atr_period)
+        if len(calc) < 30:
+            continue
+        
+        # Analiza ostatnich 120 sesji chronologicznie
+        sub = calc.tail(120)
+        in_pos = False
+        pos_entry_date = None
+        pos_entry_price = 0.0
+        pos_last_price = 0.0
+        pos_atr = 0.0
+        pos_stop = 0.0
+        pos_units = 1
+        pending_breakout = False
+        pending_signal_close = 0.0
+        pending_signal_atr = 0.0
+        
+        for i in range(1, len(sub)):
+            row = sub.iloc[i]
+            prev_row = sub.iloc[i-1]
+            open_p = float(row["Open"])
+            close = float(row["Close"])
+            low = float(row["Low"])
+            atr = float(row["ATR"])
+            donch_high = float(row["Donchian_High"])
+            prev_donch_high = float(prev_row["Donchian_High"])
+            donch_low = float(row["Donchian_Low"])
+            
+            # Realizacja wejścia na otwarciu sesji po wczorajszym wybiciu
+            if pending_breakout and not in_pos:
+                in_pos = True
+                pos_entry_date = row.name if hasattr(row, "name") else str(i)
+                pos_entry_price = open_p  # Wejście po cenie otwarcia kolejnego dnia (Open T+1)
+                pos_last_price = open_p
+                pos_atr = pending_signal_atr
+                pos_stop = round(pending_signal_close - 2.0 * pending_signal_atr, 2)
+                pos_units = 1
+                pending_breakout = False
+
+            if in_pos:
+                if (pos_stop > 0 and low <= pos_stop) or (donch_low > 0 and close < donch_low):
+                    in_pos = False
+                else:
+                    # Piramidowanie: +0.5 N
+                    if pos_units < 4 and close >= pos_last_price + 0.5 * pos_atr and pos_atr > 0:
+                        pos_units += 1
+                        pos_last_price = close
+                        pos_stop = round(close - 2.0 * pos_atr, 2)
+            else:
+                # Świeże wejście (zamknięcie dzisiaj ponad kanałem, a wczoraj poniżej -> wejście jutro na Open)
+                if not np.isnan(donch_high) and close > donch_high and (np.isnan(prev_donch_high) or float(prev_row["Close"]) <= prev_donch_high):
+                    pending_breakout = True
+                    pending_signal_close = close
+                    pending_signal_atr = atr
+                    
+        if in_pos:
+            last_close = float(calc.iloc[-1]["Close"])
+            gain_pct = ((last_close - pos_entry_price) / pos_entry_price) * 100.0 if pos_entry_price > 0 else 0.0
+            info = get_ticker_info(sym)
+            active_trends.append({
+                "symbol": sym,
+                "name": info["name"],
+                "index": info["index"],
+                "sector": info["sector"],
+                "entry_date": str(pos_entry_date)[:10],
+                "entry_price": round(pos_entry_price, 2),
+                "last_entry_price": round(pos_last_price, 2),
+                "current_price": round(last_close, 2),
+                "gain_pct": round(gain_pct, 2),
+                "units": pos_units,
+                "entry_atr": round(pos_atr, 2),
+                "stop_loss": pos_stop,
+                "avg_turnover": round(recent_turnover, 0)
+            })
+    return active_trends
+
+
 def run_portfolio_turtle_backtest(data_dict: dict, initial_capital: float, risk_pct: float,
                                  entry_period: int, exit_period: int, atr_period: int,
                                  commission_pct: float, min_turnover: float, turnover_days: int,
                                  max_positions: int = 8):
-    """
-    Symulacja portfelowa strategii Żółwi dla WSZYSTKICH spółek spełniających warunek obrotu RAZEM.
-    Wspólny kapitał (cash pool), współdzielone ryzyko i dynamiczny filtr płynności na każdą sesję.
-    """
     if not data_dict:
         return None
 
-    # Zbieramy wszystkie unikalne daty sesji w porządku chronologicznym
     all_dates = sorted(list(set().union(*[df.index.tolist() for df in data_dict.values()])))
     if len(all_dates) < max(entry_period, exit_period, turnover_days) + 10:
         return None
 
     cash = initial_capital
-    open_positions = {} # {symbol: {"shares": int, "entry_price": float, "entry_date": date, "stop_loss": float}}
+    open_positions = {}
+    pending_entries = []  # Zlecenia oczekujące na otwarcie kolejnej sesji (Open T+1)
     trades = []
     equity_curve = []
     peak_equity = initial_capital
     max_dd = 0.0
 
-    # Baza cenowa dla benchmarku (Kup i Trzymaj równoważony)
     base_prices = {sym: df["Close"].iloc[0] for sym, df in data_dict.items() if not df.empty and df["Close"].iloc[0] > 0}
 
     for current_date in all_dates:
-        # 1. Wyjścia z pozycji (Stop Loss lub Donchian Low Exit)
+        # 1. Realizacja zleceń kupna na OTWARCIU sesji (Open T+1) po wcześniejszym sygnale wybicia
+        if pending_entries:
+            for pending in pending_entries:
+                sym = pending["symbol"]
+                if sym in open_positions or len(open_positions) >= max_positions:
+                    continue
+                df = data_dict.get(sym)
+                if df is None or current_date not in df.index:
+                    continue
+                row = df.loc[current_date]
+                open_p = float(row["Open"])
+                comm_rate = commission_pct / 100.0
+                max_afford = int(np.floor(cash / (open_p * (1.0 + comm_rate))))
+                final_shares = min(pending["shares"], max_afford)
+                if final_shares > 0:
+                    trade_cost = final_shares * open_p
+                    comm = trade_cost * comm_rate
+                    total_cost = trade_cost + comm
+                    if cash >= total_cost:
+                        cash -= total_cost
+                        open_positions[sym] = {
+                            "shares": final_shares,
+                            "avg_price": open_p,
+                            "last_entry_price": open_p,
+                            "total_cost": total_cost,
+                            "units": 1,
+                            "atr": pending["atr"],
+                            "entry_date": current_date,
+                            "stop_loss": pending["stop_loss"]
+                        }
+            pending_entries = []
+
+        # 2. Wyjścia z pozycji
         for sym in list(open_positions.keys()):
             pos = open_positions[sym]
             df = data_dict.get(sym)
@@ -265,7 +385,7 @@ def run_portfolio_turtle_backtest(data_dict: dict, initial_capital: float, risk_
             if pos["stop_loss"] > 0 and low <= pos["stop_loss"]:
                 exit_triggered = True
                 actual_exit = min(open_p, pos["stop_loss"])
-                exit_reason = "Stop Loss (2x ATR)"
+                exit_reason = "Stop Loss (2x N)"
             elif donch_low > 0 and close < donch_low:
                 exit_triggered = True
                 actual_exit = close
@@ -279,17 +399,18 @@ def run_portfolio_turtle_backtest(data_dict: dict, initial_capital: float, risk_
                 gross_rev = pos["shares"] * actual_exit
                 comm = gross_rev * (commission_pct / 100.0)
                 net_rev = gross_rev - comm
-                cost = pos["shares"] * pos["entry_price"] * (1 + commission_pct / 100.0)
+                cost = pos["total_cost"]
                 pnl = net_rev - cost
-                pnl_pct = (pnl / cost) * 100.0
+                pnl_pct = (pnl / cost) * 100.0 if cost > 0 else 0.0
 
                 trades.append({
                     "Symbol": sym,
                     "Data Wejścia": pos["entry_date"].strftime("%Y-%m-%d") if hasattr(pos["entry_date"], "strftime") else str(pos["entry_date"])[:10],
-                    "Cena Wejścia": round(pos["entry_price"], 2),
+                    "Cena Średnia": round(pos["avg_price"], 2),
                     "Data Wyjścia": current_date.strftime("%Y-%m-%d") if hasattr(current_date, "strftime") else str(current_date)[:10],
                     "Cena Wyjścia": round(actual_exit, 2),
                     "Liczba Akcji": pos["shares"],
+                    "Jednostki (Units)": pos["units"],
                     "Wynik (PLN)": round(pnl, 2),
                     "Wynik (%)": round(pnl_pct, 2),
                     "Powód Wyjścia": exit_reason
@@ -298,7 +419,6 @@ def run_portfolio_turtle_backtest(data_dict: dict, initial_capital: float, risk_
                 cash += net_rev
                 del open_positions[sym]
 
-        # 2. Wycena portfela przed nowymi wejściami (do kalkulacji wielkości ryzyka)
         curr_holdings_val = sum(
             pos["shares"] * float(data_dict[sym].loc[current_date]["Close"])
             for sym, pos in open_positions.items()
@@ -306,51 +426,83 @@ def run_portfolio_turtle_backtest(data_dict: dict, initial_capital: float, risk_
         )
         current_equity = cash + curr_holdings_val
 
-        # 3. Wejścia w pozycje dla spółek spełniających obrót (jeśli mamy wolne sloty)
-        if len(open_positions) < max_positions and current_date != all_dates[-1]:
-            for sym, df in data_dict.items():
-                if sym in open_positions:
+        # 3. Piramidowanie: +0.5 N
+        if current_date != all_dates[-1]:
+            for sym, pos in list(open_positions.items()):
+                if pos["units"] >= 4:
                     continue
-                if len(open_positions) >= max_positions:
+                df = data_dict.get(sym)
+                if df is None or current_date not in df.index:
+                    continue
+                close = float(df.loc[current_date]["Close"])
+                atr = pos["atr"]
+                pyramid_trigger = pos["last_entry_price"] + 0.5 * atr
+
+                if close >= pyramid_trigger and atr > 0:
+                    new_stop = round(close - (2.0 * atr), 2)
+                    add_units = calculate_turtle_unit_size(current_equity, risk_pct, atr, close)
+                    afford = int(np.floor(cash / (close * (1 + commission_pct / 100.0))))
+                    add_units = max(0, min(add_units, afford))
+
+                    if add_units > 0:
+                        add_cost = add_units * close * (1 + commission_pct / 100.0)
+                        if cash >= add_cost:
+                            cash -= add_cost
+                            new_total_shares = pos["shares"] + add_units
+                            new_total_cost = pos["total_cost"] + add_cost
+                            pos["shares"] = new_total_shares
+                            pos["total_cost"] = new_total_cost
+                            pos["avg_price"] = new_total_cost / new_total_shares
+                            pos["last_entry_price"] = close
+                            pos["units"] += 1
+                            pos["stop_loss"] = new_stop
+
+        # 4. Skanowanie świeżych wybić po zamknięciu (do zakupu na otwarciu jutro)
+        available_slots = max_positions - len(open_positions) - len(pending_entries)
+        if available_slots > 0 and current_date != all_dates[-1]:
+            for sym, df in data_dict.items():
+                if sym in open_positions or any(p["symbol"] == sym for p in pending_entries):
+                    continue
+                if len(pending_entries) >= available_slots:
                     break
                 if current_date not in df.index:
                     continue
 
-                # Badanie obrotu z ostatnich N sesji na bieżący dzień
                 sub_history = df.loc[:current_date]
-                if len(sub_history) < turnover_days:
+                if len(sub_history) < turnover_days or len(sub_history) < 2:
                     continue
                 rolling_turnover = sub_history["Daily_Turnover"].tail(turnover_days).mean()
                 if rolling_turnover < min_turnover:
                     continue
 
-                row = sub_history.iloc[-1]
-                close = float(row["Close"])
-                atr = float(row["ATR"])
-                donch_high = float(row["Donchian_High"])
+                today_row = sub_history.iloc[-1]
+                prev_row = sub_history.iloc[-2]
 
-                # Sygnał kupna: Wybicie Donchian High
-                if not np.isnan(donch_high) and close > donch_high and atr > 0:
-                    cash_at_risk = current_equity * (risk_pct / 100.0)
-                    raw_units = int(np.floor(cash_at_risk / atr))
-                    max_cap_units = int(np.floor((current_equity * 0.25) / close)) # max 25% w 1 spółce
-                    affordable_units = int(np.floor(cash / (close * (1 + commission_pct / 100.0))))
-                    final_units = max(0, min(raw_units, max_cap_units, affordable_units))
+                close = float(today_row["Close"])
+                prev_close = float(prev_row["Close"])
+                atr = float(today_row["ATR"])
+                donch_high = float(today_row["Donchian_High"])
+                prev_donch_high = float(prev_row["Donchian_High"])
+
+                fresh_breakout = (not np.isnan(donch_high) and close > donch_high and
+                                  (np.isnan(prev_donch_high) or prev_close <= prev_donch_high))
+
+                if fresh_breakout and atr > 0:
+                    calculated_stop = round(close - 2.0 * atr, 2)
+                    raw_units = calculate_turtle_unit_size(current_equity, risk_pct, atr, close)
+                    max_cap_units = int(np.floor((current_equity * 0.25) / close))
+                    final_units = min(raw_units, max_cap_units)
 
                     if final_units > 0:
-                        trade_cost = final_units * close
-                        comm = trade_cost * (commission_pct / 100.0)
-                        total_cost = trade_cost + comm
-                        if cash >= total_cost:
-                            cash -= total_cost
-                            open_positions[sym] = {
-                                "shares": final_units,
-                                "entry_price": close,
-                                "entry_date": current_date,
-                                "stop_loss": round(close - (2.0 * atr), 2)
-                            }
+                        pending_entries.append({
+                            "symbol": sym,
+                            "shares": final_units,
+                            "stop_loss": calculated_stop,
+                            "atr": atr,
+                            "signal_date": current_date,
+                            "signal_close": close
+                        })
 
-        # 4. Wycena EOD portfela i benchmarku
         final_holdings = sum(
             pos["shares"] * float(data_dict[sym].loc[current_date]["Close"])
             for sym, pos in open_positions.items()
@@ -363,7 +515,6 @@ def run_portfolio_turtle_backtest(data_dict: dict, initial_capital: float, risk_
         if curr_dd < max_dd:
             max_dd = curr_dd
 
-        # Benchmark równoważony
         bench_ratios = [
             float(data_dict[sym].loc[current_date]["Close"]) / base_prices[sym]
             for sym in data_dict.keys()
@@ -404,7 +555,6 @@ def run_portfolio_turtle_backtest(data_dict: dict, initial_capital: float, risk_
         gross_l = abs(losses["Wynik (PLN)"].sum())
         profit_factor = gross_p / gross_l if gross_l > 0 else (99.0 if gross_p > 0 else 0.0)
 
-    # Statystyki per ticker
     sym_stats = []
     if not trades_df.empty:
         for sym, grp in trades_df.groupby("Symbol"):
@@ -448,7 +598,7 @@ strategy_mode = st.sidebar.radio(
 )
 
 if strategy_mode == "Klasyczna (System 1)":
-    st.sidebar.info("💡 **System 1 (Klasyczny):**\n- Wejście: Wybicie 20-dniowe\n- Wyjście: Wybicie 10-dniowe\n- ATR: 20 dni\n- Ryzyko: 1.0% kapitału")
+    st.sidebar.info("💡 **System 1 (Klasyczny):**\n- Świeże Wejście: Wybicie 20-dniowe\n- Dokupienie: +0.5 N (maks. 4 jednostki)\n- Wyjście: Wybicie dołka 10-dniowego\n- ATR: 20 dni | Ryzyko: 1.0%")
     entry_days, exit_days, atr_days, risk_pct = 20, 10, 20, 1.0
 else:
     st.sidebar.subheader("⚙️ Parametry Własne")
@@ -488,7 +638,7 @@ if st.sidebar.button("🔄 Pobierz z oficjalnych arkuszy GPW/NC"):
             prog.empty()
             st.sidebar.success(f"Zapisano {len(saved)} płynnych spółek na dysku!")
     except ImportError:
-        st.sidebar.error("Plik `sync_gpw_data.py` nie został znaleziony w bieżącym katalogu. Upewnij się, że pobrano wszystkie pliki projektu.")
+        st.sidebar.error("Plik `sync_gpw_data.py` nie został znaleziony w bieżącym katalogu.")
     except Exception as e:
         st.sidebar.error(f"Błąd synchronizacji: {e}")
 
@@ -496,55 +646,612 @@ if st.sidebar.button("🔄 Pobierz z oficjalnych arkuszy GPW/NC"):
 # ==========================================
 # GŁÓWNA STRUKTURA ZAKŁADEK (TABS)
 # ==========================================
-st.title("🇵🇱 Analiza i Automatyzacja Strategii Żółwi (GPW / NewConnect)")
-st.caption(f"Uniwersum GPW (.WA) od 2015 r. | Filtr: min. {min_turnover:,.0f} PLN z {turnover_window} sesji | Tryb: {strategy_mode}")
+st.title("🐢 Turtle Trading GPW & NewConnect")
+st.caption("Rozłączny System: Portfel (tylko dokupienie/sprzedaż) • Skaner (tylko świeże wejścia) • Audyt trwających trendów")
 
-tab_database, tab_scanner, tab_backtest, tab_guide = st.tabs([
-    "💾 Baza Danych na Dysku (Parquet & Linki GPW/NC)",
-    "🎯 Dzienne Sygnały (Skaner)",
+if "user_portfolio" not in st.session_state:
+    st.session_state["user_portfolio"] = load_portfolio()
+
+tab_portfolio, tab_scanner, tab_backtest, tab_database, tab_guide = st.tabs([
+    "💼 Mój Portfel Żółwia (Tylko Dokupienie / Sprzedaż)",
+    "🎯 Skaner Rynku (Tylko Świeże Wejścia)",
     "📈 Backtest Portfela GPW (Wszystkie Spółki Razem)",
+    "💾 Baza Danych na Dysku (Parquet)",
     "📚 Kompendium i Opis Strategii"
 ])
 
 
 # ==========================================
-# ZAKŁADKA 0: BAZA DANYCH NA DYSKU (PARQUET)
+# ZAKŁADKA 1: MÓJ PORTFEL ŻÓŁWIA
+# ==========================================
+with tab_portfolio:
+    st.subheader("💼 Mój Portfel Żółwia – Aktywne Pozycje")
+    st.markdown("""
+    **Ścisła reguła Żółwi:** Dla spółek, które już masz w portfelu, **nie sprawdzamy górnych wybić 20-dniowych**.
+    Monitorujemy dla nich **WYŁĄCZNIE**:
+    1. 🟢 **DOKUPIENIE (+1 Unit co +0.5 N)** – do limitu 4 jednostek, z podnoszeniem Stop Lossa.
+    2. 🚨 **SPRZEDAŻ (Stop Loss 2xN)** – obrona kapitału.
+    3. ⚠️ **SPRZEDAŻ (Wyjście 10-dniowe)** – realizacja zysku przy wybiciu dołka Donchiana.
+    """)
+
+    # -------------------------------------------------------------
+    # SEKCJA: AUDYT STARTOWY (Które spółki już wybiły i powinny być w portfelu?)
+    # -------------------------------------------------------------
+    with st.expander("🔍 Audyt Rynku: Które spółki już wybiły i powinny być teraz w portfelu?", expanded=False):
+        st.markdown("""
+        To narzędzie analizuje historię ostatnich miesięcy na GPW i NewConnect i wskazuje spółki, które:
+        - **Wybiły górny kanał Donchiana (20d)** w przeszłości,
+        - **Do dnia dzisiejszego NIE wybiły dołka (10d) ani Stop Lossa (2xN)**.
+        Możesz jednym kliknięciem załadować je jako swój aktualny portfel startowy!
+        """)
+
+        if st.button("🔎 Sprawdź rynek: Wykryj spółki będące aktualnie w trendzie", type="primary"):
+            with st.spinner("Analiza trwających trendów na GPW i NC..."):
+                prog = st.progress(0, text="Skanowanie...")
+                def cb(c, t, m):
+                    prog.progress(c / t, text=m)
+                detected = find_active_turtle_trends(
+                    tickers=get_ticker_list(),
+                    entry_period=entry_days,
+                    exit_period=exit_days,
+                    atr_period=atr_days,
+                    min_turnover=min_turnover,
+                    turnover_days=turnover_window,
+                    progress_cb=cb
+                )
+                prog.empty()
+                st.session_state["detected_active_trends"] = detected
+
+        detected_trends = st.session_state.get("detected_active_trends", [])
+        if detected_trends:
+            st.success(f"Znaleziono **{len(detected_trends)} spółek**, które wybiły wcześniej i nadal trzymają trend!")
+            det_df = pd.DataFrame(detected_trends)
+            display_det = det_df[[
+                "symbol", "name", "entry_date", "entry_price", "current_price",
+                "gain_pct", "units", "stop_loss", "entry_atr"
+            ]].copy()
+            display_det.columns = [
+                "Symbol", "Nazwa", "Data Wybicia", "Cena Wejścia", "Kurs Dziś",
+                "Wynik Trendu (%)", "Jednostki (Units)", "Stop Loss (2xN)", "ATR (N)"
+            ]
+            st.dataframe(display_det, use_container_width=True)
+
+            if st.button(f"📥 Załaduj wykryte spółki ({len(detected_trends)}) jako mój portfel", type="secondary"):
+                new_positions = []
+                for dt in detected_trends:
+                    # Obliczenie sugerowanej liczby akcji wg kapitału i ATR
+                    u_size = calculate_turtle_unit_size(initial_cap, risk_pct, dt["entry_atr"], dt["entry_price"])
+                    total_shares = max(10, u_size * dt["units"])
+                    new_positions.append({
+                        "symbol": dt["symbol"],
+                        "name": dt["name"],
+                        "entry_date": dt["entry_date"],
+                        "shares": total_shares,
+                        "units": dt["units"],
+                        "avg_price": dt["entry_price"],
+                        "last_entry_price": dt["last_entry_price"],
+                        "entry_atr": dt["entry_atr"],
+                        "stop_loss": dt["stop_loss"]
+                    })
+                save_portfolio(new_positions)
+                st.session_state["user_portfolio"] = new_positions
+                st.success("Pomyślnie załadowano spółki do Twojego portfela!")
+                safe_rerun()
+
+    positions = st.session_state.get("user_portfolio", [])
+    enhanced_positions = []
+    portfolio_alerts = []
+
+    if positions:
+        with st.spinner("Pobieranie notowań dla spółek w portfelu..."):
+            for pos in positions:
+                sym = pos["symbol"]
+                df = fetch_ticker_data(sym, start_date="2023-01-01")
+                if df.empty or len(df) < 5:
+                    enhanced_positions.append({**pos, "current_price": pos["avg_price"], "pnl_pln": 0, "pnl_pct": 0, "status": "BRAK_DANYCH"})
+                    continue
+
+                calc_df = calculate_indicators(df, entry_period=entry_days, exit_period=exit_days, atr_period=atr_days)
+                last_row = calc_df.iloc[-1]
+                close = float(last_row["Close"])
+                donch_low = float(last_row["Donchian_Low"])
+                current_atr = float(last_row["ATR"])
+
+                avg_price = float(pos.get("avg_price", pos.get("entry_price", close)))
+                last_price = float(pos.get("last_entry_price", avg_price))
+                shares = int(pos.get("shares", 0))
+                units = int(pos.get("units", 1))
+                entry_atr = float(pos.get("entry_atr", current_atr))
+                stop_loss = float(pos.get("stop_loss", round(last_price - 2.0 * entry_atr, 2)))
+
+                curr_val = shares * close
+                cost_basis = shares * avg_price
+                pnl_pln = curr_val - cost_basis
+                pnl_pct = ((close - avg_price) / avg_price) * 100.0 if avg_price > 0 else 0.0
+
+                next_pyramid_price = round(last_price + 0.5 * entry_atr, 2)
+
+                status = "TRZYMAJ"
+                action_badge = "🛡️ TRZYMAJ (W trendzie)"
+                
+                if close <= stop_loss:
+                    status = "STOP_LOSS"
+                    action_badge = "🚨 SPRZEDAJ (STOP LOSS 2xN!)"
+                    portfolio_alerts.append({
+                        "type": "error",
+                        "symbol": sym,
+                        "msg": f"**{sym}**: Kurs ({close:.2f} PLN) spadł poniżej Stop Lossa ({stop_loss:.2f} PLN). **ZAMKNIJ POZYCJĘ**, aby uciąć stratę!"
+                    })
+                elif close < donch_low:
+                    status = "EXIT_DONCHIAN"
+                    action_badge = "⚠️ SPRZEDAJ (WYJŚCIE 10d)"
+                    portfolio_alerts.append({
+                        "type": "warning",
+                        "symbol": sym,
+                        "msg": f"**{sym}**: Kurs ({close:.2f} PLN) wybił w dół 10-dniowe minimum ({donch_low:.2f} PLN). **ZREALIZUJ ZYSK / ZAMKNIJ POZYCJĘ**!"
+                    })
+                elif units < 4 and close >= next_pyramid_price:
+                    status = "DOKUP"
+                    action_badge = f"🟢 DOKUP (+1 UNIT #{units+1})"
+                    suggested_add_units = calculate_turtle_unit_size(initial_cap, risk_pct, entry_atr, close)
+                    portfolio_alerts.append({
+                        "type": "success",
+                        "symbol": sym,
+                        "msg": f"**{sym}**: Kurs ({close:.2f} PLN) przekroczył poziom dokupienia {next_pyramid_price:.2f} PLN. **DOKUP JEDNOSTKĘ #{units+1}** (sugerowane: {suggested_add_units} akcji). Nowy Stop Loss: {round(close - 2*entry_atr, 2):.2f} PLN."
+                    })
+
+                enhanced_positions.append({
+                    **pos,
+                    "name": pos.get("name", get_ticker_info(sym)["name"]),
+                    "current_price": close,
+                    "current_val": curr_val,
+                    "pnl_pln": pnl_pln,
+                    "pnl_pct": pnl_pct,
+                    "stop_loss": stop_loss,
+                    "next_pyramid_price": next_pyramid_price if units < 4 else "-",
+                    "donch_low": donch_low,
+                    "current_atr": current_atr,
+                    "status": status,
+                    "action_badge": action_badge
+                })
+
+    if portfolio_alerts:
+        st.subheader("🔔 Pilne Alerty Operacyjne dla Portfela:")
+        for al in portfolio_alerts:
+            if al["type"] == "error":
+                st.error(al["msg"])
+            elif al["type"] == "warning":
+                st.warning(al["msg"])
+            else:
+                st.success(al["msg"])
+    else:
+        if positions:
+            st.info("✅ Brak pilnych działań: Wszystkie otwarte pozycje rozwijają się w trendzie. Żadna nie osiągnęła poziomu Stop Loss ani sygnału wyjścia.")
+
+    if enhanced_positions:
+        total_port_val = sum(p["current_val"] for p in enhanced_positions)
+        total_pnl_pln = sum(p["pnl_pln"] for p in enhanced_positions)
+        total_cost = sum(p["shares"] * float(p["avg_price"]) for p in enhanced_positions)
+        total_pnl_pct = (total_pnl_pln / total_cost) * 100.0 if total_cost > 0 else 0.0
+
+        kp1, kp2, kp3, kp4 = st.columns(4)
+        kp1.metric("Wycena Akcji w Portfelu", f"{total_port_val:,.2f} PLN")
+        kp2.metric("Łączny Wynik Portfela", f"{total_pnl_pln:+,.2f} PLN", delta=f"{total_pnl_pct:+.2f}%")
+        kp3.metric("Pozycje w Portfelu", f"{len(enhanced_positions)} / {max_simul_pos}")
+        kp4.metric("Sygnały Dokupienia (+0.5N)", f"{sum(1 for p in enhanced_positions if p['status'] == 'DOKUP')}")
+
+        st.markdown("---")
+        st.subheader("📋 Tabela Twoich Aktywnych Pozycji")
+
+        table_rows = []
+        for p in enhanced_positions:
+            table_rows.append({
+                "Symbol": p["symbol"],
+                "Nazwa": p["name"],
+                "Data Zakupu": p.get("entry_date", "-"),
+                "Akcje": p["shares"],
+                "Units": f"{p.get('units', 1)} / 4",
+                "Śr. Zakup (PLN)": round(float(p["avg_price"]), 2),
+                "Ostatni Zakup (PLN)": round(float(p.get("last_entry_price", p["avg_price"])), 2),
+                "Kurs (PLN)": round(p["current_price"], 2),
+                "Wynik (PLN)": round(p["pnl_pln"], 2),
+                "Wynik (%)": f"{p['pnl_pct']:+.2f}%",
+                "Stop Loss (PLN)": p["stop_loss"],
+                "Kolejne Dokupienie (+0.5N)": p["next_pyramid_price"],
+                "Zalecenie": p["action_badge"]
+            })
+
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("⚙️ Operacje na Wybranej Pozycji Portfela")
+        col_sel, col_act = st.columns([2, 3])
+
+        with col_sel:
+            selected_sym = st.selectbox(
+                "Wybierz spółkę z portfela:",
+                options=[p["symbol"] for p in enhanced_positions]
+            )
+
+        with col_act:
+            if selected_sym:
+                cur_pos = next(p for p in enhanced_positions if p["symbol"] == selected_sym)
+                c_btn1, c_btn2 = st.columns(2)
+
+                with c_btn1:
+                    if cur_pos["units"] < 4:
+                        if st.button(f"➕ Zrealizuj Dokupienie (+1 Unit) dla {selected_sym}", use_container_width=True):
+                            add_price = cur_pos["current_price"]
+                            new_stop = round(add_price - 2.0 * cur_pos["current_atr"], 2)
+                            s_units = calculate_turtle_unit_size(initial_cap, risk_pct, add_price, new_stop, commission)
+                            s_units = max(1, s_units)
+                            new_shares = cur_pos["shares"] + s_units
+                            new_total_cost = (cur_pos["shares"] * float(cur_pos["avg_price"])) + (s_units * add_price)
+                            new_avg = new_total_cost / new_shares
+
+                            for p in positions:
+                                if p["symbol"] == selected_sym:
+                                    p["shares"] = new_shares
+                                    p["avg_price"] = new_avg
+                                    p["last_entry_price"] = add_price
+                                    p["units"] = p.get("units", 1) + 1
+                                    p["stop_loss"] = new_stop
+                            save_portfolio(positions)
+                            st.session_state["user_portfolio"] = positions
+                            st.success(f"Dodano jednostkę dla {selected_sym}! Nowy stan: {new_shares} akcji, średnia cena {new_avg:.2f} PLN, Stop Loss: {new_stop:.2f} PLN.")
+                            safe_rerun()
+                    else:
+                        st.info(f"{selected_sym} osiągnął już maksymalny limit 4 jednostek.")
+
+                with c_btn2:
+                    if st.button(f"❌ Zamknij Pozycję {selected_sym}", type="secondary", use_container_width=True):
+                        hist = load_closed_history()
+                        hist.append({
+                            "Symbol": selected_sym,
+                            "Nazwa": cur_pos["name"],
+                            "Data Zakupu": cur_pos.get("entry_date", "-"),
+                            "Data Zamknięcia": date.today().strftime("%Y-%m-%d"),
+                            "Akcje": cur_pos["shares"],
+                            "Jednostki": cur_pos["units"],
+                            "Śr. Cena Zakupu": round(float(cur_pos["avg_price"]), 2),
+                            "Cena Zamknięcia": round(cur_pos["current_price"], 2),
+                            "Zysk/Strata (PLN)": round(cur_pos["pnl_pln"], 2),
+                            "Zysk/Strata (%)": f"{cur_pos['pnl_pct']:+.2f}%",
+                            "Powód": cur_pos["status"]
+                        })
+                        save_closed_history(hist)
+
+                        positions = [p for p in positions if p["symbol"] != selected_sym]
+                        save_portfolio(positions)
+                        st.session_state["user_portfolio"] = positions
+                        st.warning(f"Zamknięto pozycję {selected_sym} i przeniesiono do historii transakcji.")
+                        safe_rerun()
+
+    else:
+        st.info("Twój portfel jest obecnie pusty. Skorzystaj z powyższego narzędzia 'Audyt Rynku', aby jednym kliknięciem załadować trwające trendy, lub dodaj spółkę ręcznie.")
+
+    st.markdown("---")
+    with st.expander("➕ Dodaj Spółkę do Portfela Ręcznie"):
+        all_syms = get_ticker_list()
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            manual_sym = st.selectbox("Symbol spółki:", options=all_syms)
+        with fc2:
+            manual_date = st.date_input("Data otwarcia pozycji:", value=date.today())
+        with fc3:
+            manual_shares = st.number_input("Liczba akcji (Units):", min_value=1, value=100, step=10)
+
+        fc4, fc5, fc6 = st.columns(3)
+        with fc4:
+            manual_price = st.number_input("Cena zakupu za akcję (PLN):", min_value=0.01, value=10.0, step=0.1)
+        with fc5:
+            manual_atr = st.number_input("Wartość ATR (N) przy wejściu:", min_value=0.01, value=1.0, step=0.05)
+        with fc6:
+            calc_manual_stop = round(manual_price - 2.0 * manual_atr, 2)
+            manual_stop = st.number_input("Stop Loss (domyślnie 2x ATR):", value=calc_manual_stop)
+
+        if st.button("💾 Zapisz Pozycję w Portfelu", type="primary"):
+            positions = st.session_state.get("user_portfolio", [])
+            if any(p["symbol"] == manual_sym for p in positions):
+                st.error(f"Spółka {manual_sym} już znajduje się w Twoim portfelu!")
+            else:
+                positions.append({
+                    "symbol": manual_sym,
+                    "name": get_ticker_info(manual_sym)["name"],
+                    "entry_date": manual_date.strftime("%Y-%m-%d"),
+                    "shares": int(manual_shares),
+                    "units": 1,
+                    "avg_price": float(manual_price),
+                    "last_entry_price": float(manual_price),
+                    "entry_atr": float(manual_atr),
+                    "stop_loss": float(manual_stop)
+                })
+                save_portfolio(positions)
+                st.session_state["user_portfolio"] = positions
+                st.success(f"Dodano {manual_sym} do portfela!")
+                safe_rerun()
+
+    closed_trades = load_closed_history()
+    if closed_trades:
+        st.markdown("---")
+        with st.expander(f"📜 Historia Zamkniętych Pozycji ({len(closed_trades)} transakcji)"):
+            st.dataframe(pd.DataFrame(closed_trades), use_container_width=True)
+
+
+# ==========================================
+# ZAKŁADKA 2: SKANER RYNKU (TYLKO ŚWIEŻE WEJŚCIA)
+# ==========================================
+with tab_scanner:
+    st.subheader("🎯 Skaner Rynku GPW & NewConnect – Wyłącznie Świeże Wybicia")
+    
+    portfolio_symbols = [p["symbol"] for p in st.session_state.get("user_portfolio", [])]
+    if portfolio_symbols:
+        st.info(f"💡 **Spółki w Twoim portfelu ({len(portfolio_symbols)}):** {', '.join(portfolio_symbols)}. Zostały wyłączone z tego skanera, ponieważ są już monitorowane w zakładce Portfel pod kątem dokupienia lub sprzedaży.")
+
+    st.markdown("""
+    **Zasada działania skanera i egzekucji:**
+    * Przeszukuje rynek pod kątem **TYLKO I WYŁĄCZNIE ŚWIEŻEGO WYBICIA 20-DNIOWEGO KANAŁU DONCHIANA** (Breakout High na sesji T).
+    * **Egzekucja wejścia:** Zlecenie kupna składane jest na **kolejny dzień sesyjny po cenie otwarcia (Open T+1)**.
+    * **Zarządzanie wielkością pozycji (Tradycyjny model Żółwi):** 1 Unit = floor((Kapitał × 1%) / ATR). Stop Loss wynosi standardowo 2 × ATR ($2N$) od poziomu wejścia.
+    * Spółki z portfela są wyłączone ze skanera i monitorowane w zakładce Portfel pod kątem dokupienia (+0.5 ATR) lub sprzedaży.
+    """)
+
+    col_btn, col_info = st.columns([1, 3])
+    with col_btn:
+        run_scan = st.button("🚀 Skanuj Rynek (Świeże Wybicia)", type="primary", use_container_width=True)
+    with col_info:
+        st.caption(f"Filtr: Płynność min. {min_turnover:,.0f} PLN | Długość kanału: {entry_days} sesji | Tradycyjny model Żółwi (1 Unit = 1% / ATR)")
+
+    if run_scan or "scan_results" in st.session_state:
+        if run_scan:
+            scan_data = []
+            all_tickers = get_ticker_list()
+            # Wykluczamy spółki będące już w portfelu!
+            available_tickers = [s for s in all_tickers if s not in portfolio_symbols]
+            total = len(available_tickers)
+            progress_bar = st.progress(0, text="Skanowanie rynku w poszukiwaniu świeżych wybić...")
+
+            for idx, symbol in enumerate(available_tickers):
+                progress_bar.progress((idx + 1) / total, text=f"Analiza {symbol} ({idx+1}/{total})...")
+                df = fetch_ticker_data(symbol, start_date="2023-01-01")
+                if df.empty or len(df) < turnover_window:
+                    continue
+
+                recent_turnover = (df["Close"] * df["Volume"]).tail(turnover_window).mean()
+                if recent_turnover < min_turnover:
+                    continue
+
+                info = get_ticker_info(symbol)
+                calc_df = calculate_indicators(df, entry_period=entry_days, exit_period=exit_days, atr_period=atr_days)
+                if calc_df.empty or len(calc_df) < 2:
+                    continue
+
+                last_row = calc_df.iloc[-1]
+                prev_row = calc_df.iloc[-2]
+
+                close = float(last_row["Close"])
+                prev_close = float(prev_row["Close"])
+                change_pct = ((close - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+                atr = float(last_row["ATR"])
+                donch_high = float(last_row["Donchian_High"])
+                prev_donch_high = float(prev_row["Donchian_High"])
+
+                # ŚWIEŻE WYBICIE GÓRNEGO KANAŁU DZIŚ:
+                is_fresh_buy = (close > donch_high) and (prev_close <= prev_donch_high)
+
+                if is_fresh_buy:
+                    stop_loss = round(close - (2.0 * atr), 2)
+                    unit_size = calculate_turtle_unit_size(initial_cap, risk_pct, atr, close)
+                    position_val = unit_size * close
+                    total_risk_val = unit_size * atr
+
+                    scan_data.append({
+                        "Symbol": symbol,
+                        "Nazwa": info["name"],
+                        "Cena Sygnału (Close T)": round(close, 2),
+                        "Zlecenie Egzekucji": "Kupno na Otwarcie (Open T+1)",
+                        "Zmiana (%)": round(change_pct, 2),
+                        "Donchian High (20d)": round(donch_high, 2),
+                        "ATR (20) [N]": round(atr, 2),
+                        "Stop Loss (2x N)": stop_loss,
+                        "Unit Size (Tradycyjny 1 Unit)": unit_size,
+                        "Wartość Zlecenia (PLN)": round(position_val, 2),
+                        "Ekspozycja Ryzyka (1N)": f"{total_risk_val:,.0f} PLN",
+                        "Śr. Obrót 60d (PLN)": round(recent_turnover, 0),
+                        "Indeks": info["index"],
+                        "Sektor": info["sector"]
+                    })
+
+            progress_bar.empty()
+            st.session_state["scan_results"] = pd.DataFrame(scan_data)
+
+        fresh_results = st.session_state.get("scan_results", pd.DataFrame())
+
+        if not fresh_results.empty:
+            st.success(f"🎉 Wykryto **{len(fresh_results)} ŚWIEŻYCH SYGNAŁÓW KUPNA** na GPW/NC po ostatniej sesji!")
+            st.dataframe(fresh_results, use_container_width=True)
+
+            # Szybkie kupno i dodanie do portfela
+            st.markdown("---")
+            st.subheader("⚡ Kup i Przenieś Świeże Wybicie do Mojego Portfela (Egzekucja na Open T+1):")
+            q_col1, q_col2 = st.columns([2, 1])
+            with q_col1:
+                fresh_pick = st.selectbox(
+                    "Wybierz spółkę ze świeżego wybicia:",
+                    options=fresh_results["Symbol"].tolist()
+                )
+            with q_col2:
+                st.write("")
+                st.write("")
+                if st.button("📥 Kup 1. Jednostkę i Dodaj do Portfela", type="primary", use_container_width=True):
+                    pick_row = fresh_results[fresh_results["Symbol"] == fresh_pick].iloc[0]
+                    cur_positions = st.session_state.get("user_portfolio", [])
+                    cur_positions.append({
+                        "symbol": fresh_pick,
+                        "name": pick_row["Nazwa"],
+                        "entry_date": (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                        "shares": int(pick_row["Unit Size (Tradycyjny 1 Unit)"]),
+                        "units": 1,
+                        "avg_price": float(pick_row["Cena Sygnału (Close T)"]),
+                        "last_entry_price": float(pick_row["Cena Sygnału (Close T)"]),
+                        "entry_atr": float(pick_row["ATR (20) [N]"]),
+                        "stop_loss": float(pick_row["Stop Loss (2x N)"]),
+                        "note": "Wejście po cenie otwarcia kolejnej sesji (Open T+1)"
+                    })
+                    save_portfolio(cur_positions)
+                    st.session_state["user_portfolio"] = cur_positions
+                    st.success(f"Pomyślnie dodano {fresh_pick}! Spółka trafiła do Portfela (wejście na Otwarcie T+1) i od teraz będą dla niej generowane sygnały dokupienia lub sprzedaży.")
+                    safe_rerun()
+        else:
+            st.info("Brak świeżych wybić na ostatniej sesji dla wolnych spółek z rynku. Żadna nowa spółka nie wybiła dzisiaj 20-dniowego szczytu.")
+
+
+# ==========================================
+# ZAKŁADKA 3: BACKTEST PORTFELA RAZEM
+# ==========================================
+with tab_backtest:
+    st.subheader("Symulacja Portfelowa dla WSZYSTKICH Spółek GPW / NC Razem")
+    st.markdown("""
+    Symulacja uruchamia **jeden wspólny portfel inwestycyjny** dla całego koszyka spółek o zadanym poziomie obrotu (domyślnie min. 100k PLN z 60 sesji).
+    Kapitał jest alokowany **wyłącznie przy świeżych wybiciach**, a w trakcie trwania trendu realizowane jest **dokupowanie (piramidowanie co +0.5 N do 4 jednostek)** z podnoszeniem Stop Lossa.
+    """)
+
+    col_d1, col_d2, col_btn = st.columns([1, 1, 1])
+    with col_d1:
+        start_date_input = st.date_input("Data początkowa (od 2015)", value=date(2015, 1, 1), min_value=date(2015, 1, 1), max_value=date.today())
+    with col_d2:
+        end_date_input = st.date_input("Data końcowa", value=date.today(), min_value=date(2015, 1, 2), max_value=date.today())
+    with col_btn:
+        st.write("")
+        st.write("")
+        run_port_btn = st.button("📊 Uruchom Symulację Całego Portfela", type="primary", use_container_width=True)
+
+    if run_port_btn or "portfolio_backtest_res" in st.session_state:
+        if run_port_btn:
+            tickers = get_ticker_list()
+            data_dict = {}
+            prog = st.progress(0, text="Pobieranie notowań spółek koszyka...")
+
+            for idx, symbol in enumerate(tickers):
+                prog.progress((idx + 1) / len(tickers), text=f"Wczytywanie {symbol} ({idx+1}/{len(tickers)})...")
+                raw = fetch_ticker_data(symbol, start_date=start_date_input.strftime("%Y-%m-%d"))
+                if not raw.empty:
+                    sliced = raw.loc[str(start_date_input):str(end_date_input)]
+                    if len(sliced) >= turnover_window:
+                        calc = calculate_indicators(sliced, entry_period=entry_days, exit_period=exit_days, atr_period=atr_days)
+                        data_dict[symbol] = calc
+
+            prog.empty()
+
+            with st.spinner("Przetwarzanie portfelowej symulacji Turtle z piramidowaniem dla wszystkich spółek..."):
+                res = run_portfolio_turtle_backtest(
+                    data_dict=data_dict,
+                    initial_capital=initial_cap,
+                    risk_pct=risk_pct,
+                    entry_period=entry_days,
+                    exit_period=exit_days,
+                    atr_period=atr_days,
+                    commission_pct=commission,
+                    min_turnover=min_turnover,
+                    turnover_days=turnover_window,
+                    max_positions=max_simul_pos
+                )
+                st.session_state["portfolio_backtest_res"] = res
+
+        result = st.session_state.get("portfolio_backtest_res")
+
+        if result is None:
+            st.error("Brak wystarczających danych do przeprowadzenia symulacji portfelowej.")
+        else:
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            ret = result["total_return_pct"]
+            m1.metric("Wynik Portfela", f"{ret:+.2f}%", delta=f"{result['final_equity'] - initial_cap:+,.0f} PLN")
+            m2.metric("Max Drawdown Portfela", f"{result['max_drawdown_pct']:.2f}%")
+            m3.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
+            m4.metric("Liczba Transakcji Razem", result["total_trades"])
+            m5.metric("Skuteczność (Win Rate)", f"{result['win_rate']:.1f}%")
+            m6.metric("Profit Factor", f"{result['profit_factor']:.2f}")
+
+            st.markdown("---")
+
+            eq_df = result["equity_df"]
+            trades_df = result["trades_df"]
+
+            fig = make_subplots(
+                rows=3, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.04,
+                subplot_titles=(
+                    f"Krzywa Kapitału Portfela Turtle (Wszystkie Płynne Spółki Razem) vs Benchmark",
+                    "Liczba Jednocześnie Otwartych Pozycji w Portfelu",
+                    "Obsunięcie Kapitału Portfela (Drawdown %)"
+                ),
+                row_heights=[0.55, 0.25, 0.20]
+            )
+
+            fig.add_trace(go.Scatter(
+                x=eq_df["Date"], y=eq_df["Equity"],
+                mode="lines", name="Kapitał Portfela Turtle (PLN)",
+                line=dict(color="#10b981", width=2.5)
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=eq_df["Date"], y=eq_df["Benchmark"],
+                mode="lines", name="Benchmark Kup i Trzymaj (PLN)",
+                line=dict(color="#94a3b8", width=1.5, dash="dot")
+            ), row=1, col=1)
+
+            fig.add_trace(go.Bar(
+                x=eq_df["Date"], y=eq_df["Active_Positions"],
+                name="Aktywne Spółki w Portfelu",
+                marker_color="#38bdf8"
+            ), row=2, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=eq_df["Date"], y=eq_df["Drawdown"],
+                mode="lines", name="Obsunięcie (%)",
+                line=dict(color="#ef4444", width=1.5),
+                fill="tozeroy"
+            ), row=3, col=1)
+
+            fig.update_layout(
+                height=850,
+                template="plotly_dark",
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("📊 Wyniki w Rozbiciu na Poszczególne Spółki Portfela")
+            sym_df = result["symbol_stats_df"]
+            if not sym_df.empty:
+                st.dataframe(sym_df, use_container_width=True)
+
+            st.subheader(f"📋 Chronologiczny Dziennik Wszystkich Transakcji Portfela ({len(trades_df)})")
+            if not trades_df.empty:
+                st.dataframe(trades_df, use_container_width=True)
+                csv_trades = trades_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "📥 Pobierz pełny dziennik transakcji (CSV)",
+                    data=csv_trades,
+                    file_name=f"portfolio_turtle_trades_{date.today().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("Brak zamkniętych transakcji w zadanym oknie czasowym.")
+
+
+# ==========================================
+# ZAKŁADKA 4: BAZA DANYCH NA DYSKU (PARQUET)
 # ==========================================
 with tab_database:
     st.subheader("💾 Trwała Baza Danych na Dysku Komputera (Format Apache Parquet)")
     st.markdown(f"""
-    Zgodnie z wymaganiem, dane historyczne od 2015 r. pobierane są **dwuetapowo** i zapisywane **trwale na dysku w plikach `.parquet`** (katalog `{CACHE_DIR}/`).
+    Dane historyczne od 2015 r. pobierane są **dwuetapowo** i zapisywane **trwale na dysku w plikach `.parquet`** (katalog `{CACHE_DIR}/`).
     
     > 💡 **Dlaczego to idealne rozwiązanie?**  
     > Ponieważ symulacje testowe wykonujesz maksymalnie **1-2 razy w roku**, nie potrzebujesz codziennego odpytywania API. Raz pobrana baza pozwala na błyskawiczne, wielokrotne testowanie strategii offline w ułamku sekundy bez obciążania łącza.
-    """)
-
-    # 4 karty metryk
-    cached_files = [f for f in os.listdir(CACHE_DIR) if f.endswith(".parquet")] if os.path.exists(CACHE_DIR) else []
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Spółki w Bazie na Dysku", f"{len(cached_files)} walorów", delta="cache_data/*.parquet")
-    c2.metric("Filtr Średniego Obrotu", f"{min_turnover:,.0f} PLN", delta=f"{turnover_window} ostatnich sesji")
-    c3.metric("Zakres Historyczny", "od 2015 r. do dziś", delta="ponad 2 700 świec")
-    c4.metric("Format Zapisu", "Apache Parquet", delta="kompresja snappy")
-
-    st.markdown("---")
-    st.subheader("🔗 Sprawdzone Oficjalne Źródła Notowań Ciągłych GPW i NewConnect")
-    st.markdown("Skrypt automatycznie odpytuje poniższe oficjalne arkusze kalkulacyjne dla bieżącej lub wybranej sesji giełdowej:")
-
-    col_l1, col_l2 = st.columns(2)
-    with col_l1:
-        st.markdown("**1. Giełda Papierów Wartościowych w Warszawie (Rynek Główny):**")
-        st.code("https://www.gpw.pl/pub/GPW/files/quotations_xls/PL/akcje-i-pda/notowania-ciagle/{date_str}.xls", language="text")
-    with col_l2:
-        st.markdown("**2. Rynek NewConnect (NC):**")
-        st.code("https://newconnect.pl/pub/NEWCONNECT/files/quotations_xls/PL/notowania-ciagle/{date_str}.xls", language="text")
-
-    st.markdown("---")
-    st.subheader("⚙️ Dwuetapowy Mechanizm Pobierania i Aktualizacji")
-    st.markdown(f"""
-    1. **Krok 1 (Pobranie pełnej listy):** Skrypt pobiera oba oficjalne pliki `.xls` zawierające komplet spółek (~760 walorów).
-    2. **Krok 2 (Weryfikacja płynności):** Bada średni obrót dzienny (Cena * Wolumen) z ostatnich **{turnover_window} sesji**. Spółki o obrocie poniżej **{min_turnover:,.0f} PLN** są natychmiast odrzucane.
-    3. **Krok 3 (Pobranie i zapis Parquet):** Pełna historia OHLCV od 2015 r. pobierana jest **tylko dla spółek spełniających warunek płynności** i zapisywana w `{CACHE_DIR}/<SYMBOL>.parquet`.
     """)
 
     if st.button("🚀 Uruchom Dwuetapową Synchronizację i Zapisz do Parquet", type="primary", use_container_width=True):
@@ -564,11 +1271,10 @@ with tab_database:
             st.success(f"✅ Pomyślnie zsynchronizowano bazę danych! Zapisano {len(saved_tickers)} płynnych spółek w katalogu {CACHE_DIR}/.")
             safe_rerun()
         except ImportError:
-            st.error("Plik `sync_gpw_data.py` nie został znaleziony w bieżącym katalogu. Upewnij się, że plik `sync_gpw_data.py` znajduje się w tym samym folderze co `app.py`.")
+            st.error("Plik `sync_gpw_data.py` nie został znaleziony w bieżącym katalogu.")
         except Exception as e:
             st.error(f"Wystąpił błąd podczas synchronizacji: {e}")
 
-    # Tabela istniejących plików Parquet
     if cached_files:
         st.markdown("---")
         st.subheader(f"📁 Pliki Parquet Aktualnie Zapisane na Dysku ({len(cached_files)} plików)")
@@ -603,279 +1309,27 @@ with tab_database:
 
 
 # ==========================================
-# ZAKŁADKA 1: SKANER SYGNAŁÓW DZIENNYCH
-# ==========================================
-with tab_scanner:
-    st.subheader("Skaner Rynku GPW & NewConnect po zamknięciu sesji")
-    st.markdown("Wykrywa aktualne wybicia ze szczytów i dołków kanału Donchiana oraz kalkuluje bezpieczną wielkość pozycji (*Unit Size*) zgodnie z zasadami Richarda Dennisa.")
-
-    col_btn, col_opt = st.columns([1, 3])
-    with col_btn:
-        run_scan = st.button("🚀 Uruchom Skanowanie Rynku", type="primary", use_container_width=True)
-    with col_opt:
-        filter_signal = st.selectbox("Filtruj tabelę:", ["Wszystkie spółki spełniające płynność", "Tylko Sygnały KUPNA (Breakout High)", "Tylko Sygnały SPRZEDAŻY (Exit Low)"])
-
-    if run_scan or "scan_results" in st.session_state:
-        if run_scan:
-            scan_data = []
-            progress_bar = st.progress(0, text="Pobieranie notowań z GPW...")
-            tickers = get_ticker_list()
-            total = len(tickers)
-
-            for idx, symbol in enumerate(tickers):
-                progress_bar.progress((idx + 1) / total, text=f"Analiza {symbol} ({idx+1}/{total})...")
-                df = fetch_ticker_data(symbol, start_date="2023-01-01")
-                if df.empty or len(df) < turnover_window:
-                    continue
-
-                recent_turnover = (df["Close"] * df["Volume"]).tail(turnover_window).mean()
-                if recent_turnover < min_turnover:
-                    continue
-
-                info = get_ticker_info(symbol)
-                calc_df = calculate_indicators(df, entry_period=entry_days, exit_period=exit_days, atr_period=atr_days)
-                if calc_df.empty:
-                    continue
-
-                last_row = calc_df.iloc[-1]
-                prev_row = calc_df.iloc[-2] if len(calc_df) >= 2 else last_row
-
-                close = float(last_row["Close"])
-                prev_close = float(prev_row["Close"])
-                change_pct = ((close - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
-                atr = float(last_row["ATR"])
-                donch_high = float(last_row["Donchian_High"])
-                donch_low = float(last_row["Donchian_Low"])
-
-                signal = "BRAK"
-                if close > donch_high:
-                    signal = "KUPUJ (Breakout)"
-                elif close < donch_low:
-                    signal = "SPRZEDAJ (Exit)"
-
-                unit_size = calculate_turtle_unit_size(initial_cap, risk_pct, atr, close)
-                position_val = unit_size * close
-                stop_loss = round(close - (2.0 * atr), 2)
-
-                scan_data.append({
-                    "Symbol": symbol,
-                    "Nazwa": info["name"],
-                    "Indeks": info["index"],
-                    "Sektor": info["sector"],
-                    "Cena (PLN)": round(close, 2),
-                    "Zmiana (%)": round(change_pct, 2),
-                    "Śr. Obrót 60d (PLN)": round(recent_turnover, 0),
-                    "ATR (20)": round(atr, 2),
-                    "Sygnał": signal,
-                    "Donchian High": round(donch_high, 2),
-                    "Donchian Low": round(donch_low, 2),
-                    "Stop Loss (2x ATR)": stop_loss,
-                    "Unit Size (Akcje)": unit_size,
-                    "Wartość Pozycji (PLN)": round(position_val, 2),
-                    "Ryzyko PLN (1%)": round(initial_cap * (risk_pct / 100), 2)
-                })
-
-            progress_bar.empty()
-            st.session_state["scan_results"] = pd.DataFrame(scan_data)
-
-        results_df = st.session_state.get("scan_results", pd.DataFrame())
-
-        if not results_df.empty:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Spółki spełniające płynność", len(results_df))
-            buy_count = len(results_df[results_df["Sygnał"] == "KUPUJ (Breakout)"])
-            sell_count = len(results_df[results_df["Sygnał"] == "SPRZEDAJ (Exit)"])
-            c2.metric("Sygnały KUPNA", buy_count)
-            c3.metric("Sygnały SPRZEDAŻY", sell_count)
-            c4.metric("Kapitał w kalkulatorze", f"{initial_cap:,.0f} PLN")
-
-            filtered_df = results_df.copy()
-            if filter_signal == "Tylko Sygnały KUPNA (Breakout High)":
-                filtered_df = filtered_df[filtered_df["Sygnał"] == "KUPUJ (Breakout)"]
-            elif filter_signal == "Tylko Sygnały SPRZEDAŻY (Exit Low)":
-                filtered_df = filtered_df[filtered_df["Sygnał"] == "SPRZEDAJ (Exit)"]
-
-            st.dataframe(filtered_df, use_container_width=True, height=500)
-
-            csv = filtered_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "📥 Pobierz wyniki skanera do CSV",
-                data=csv,
-                file_name=f"turtle_signals_gpw_{date.today().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
-
-
-# ==========================================
-# ZAKŁADKA 2: BACKTEST PORTFELA RAZEM (WSZYSTKIE SPÓŁKI)
-# ==========================================
-with tab_backtest:
-    st.subheader("Symulacja Portfelowa dla WSZYSTKICH Spółek GPW / NC Razem")
-    st.markdown("""
-    Symulacja uruchamia **jeden wspólny portfel inwestycyjny** dla całego koszyka spółek o zadanym poziomie obrotu (domyślnie min. 100k PLN z 60 sesji).
-    Kapitał jest dynamicznie alokowany pomiędzy pojawiające się wybicia szczytów wg zasady 1% ryzyka kapitału na 1x ATR, a pozycje zamykane są po osiągnięciu Stop Lossa (2x ATR) lub wybicia dołka kanału Donchiana.
-    """)
-
-    col_d1, col_d2, col_btn = st.columns([1, 1, 1])
-    with col_d1:
-        start_date_input = st.date_input("Data początkowa (od 2015)", value=date(2015, 1, 1), min_value=date(2015, 1, 1), max_value=date.today())
-    with col_d2:
-        end_date_input = st.date_input("Data końcowa", value=date.today(), min_value=date(2015, 1, 2), max_value=date.today())
-    with col_btn:
-        st.write("")
-        st.write("")
-        run_port_btn = st.button("📊 Uruchom Symulację Całego Portfela", type="primary", use_container_width=True)
-
-    if run_port_btn or "portfolio_backtest_res" in st.session_state:
-        if run_port_btn:
-            tickers = get_ticker_list()
-            data_dict = {}
-            prog = st.progress(0, text="Pobieranie notowań spółek koszyka...")
-
-            for idx, symbol in enumerate(tickers):
-                prog.progress((idx + 1) / len(tickers), text=f"Wczytywanie {symbol} ({idx+1}/{len(tickers)})...")
-                raw = fetch_ticker_data(symbol, start_date=start_date_input.strftime("%Y-%m-%d"))
-                if not raw.empty:
-                    # Ograniczenie do wybranego przedziału dat
-                    sliced = raw.loc[str(start_date_input):str(end_date_input)]
-                    if len(sliced) >= turnover_window:
-                        calc = calculate_indicators(sliced, entry_period=entry_days, exit_period=exit_days, atr_period=atr_days)
-                        data_dict[symbol] = calc
-
-            prog.empty()
-
-            with st.spinner("Przetwarzanie portfelowej symulacji Turtle dla wszystkich płynnych spółek..."):
-                res = run_portfolio_turtle_backtest(
-                    data_dict=data_dict,
-                    initial_capital=initial_cap,
-                    risk_pct=risk_pct,
-                    entry_period=entry_days,
-                    exit_period=exit_days,
-                    atr_period=atr_days,
-                    commission_pct=commission,
-                    min_turnover=min_turnover,
-                    turnover_days=turnover_window,
-                    max_positions=max_simul_pos
-                )
-                st.session_state["portfolio_backtest_res"] = res
-
-        result = st.session_state.get("portfolio_backtest_res")
-
-        if result is None:
-            st.error("Brak wystarczających danych do przeprowadzenia symulacji portfelowej.")
-        else:
-            # Główne metryki portfela
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            ret = result["total_return_pct"]
-            m1.metric("Wynik Portfela", f"{ret:+.2f}%", delta=f"{result['final_equity'] - initial_cap:+,.0f} PLN")
-            m2.metric("Max Drawdown Portfela", f"{result['max_drawdown_pct']:.2f}%")
-            m3.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
-            m4.metric("Liczba Transakcji Razem", result["total_trades"])
-            m5.metric("Skuteczność (Win Rate)", f"{result['win_rate']:.1f}%")
-            m6.metric("Profit Factor", f"{result['profit_factor']:.2f}")
-
-            st.markdown("---")
-
-            # Wykres Plotly: Krzywa Kapitału Portfela vs Benchmark
-            eq_df = result["equity_df"]
-            trades_df = result["trades_df"]
-
-            fig = make_subplots(
-                rows=3, cols=1,
-                shared_xaxes=True,
-                vertical_spacing=0.04,
-                subplot_titles=(
-                    f"Krzywa Kapitału Portfela Turtle (Wszystkie Płynne Spółki Razem) vs Benchmark",
-                    "Liczba Jednocześnie Otwartych Pozycji w Portfelu",
-                    "Obsunięcie Kapitału Portfela (Drawdown %)"
-                ),
-                row_heights=[0.55, 0.25, 0.20]
-            )
-
-            # 1. Krzywa kapitału
-            fig.add_trace(go.Scatter(
-                x=eq_df["Date"], y=eq_df["Equity"],
-                mode="lines", name="Kapitał Portfela Turtle (PLN)",
-                line=dict(color="#10b981", width=2.5)
-            ), row=1, col=1)
-
-            fig.add_trace(go.Scatter(
-                x=eq_df["Date"], y=eq_df["Benchmark"],
-                mode="lines", name="Benchmark Kup i Trzymaj (PLN)",
-                line=dict(color="#94a3b8", width=1.5, dash="dot")
-            ), row=1, col=1)
-
-            # 2. Liczba aktywnych pozycji
-            fig.add_trace(go.Bar(
-                x=eq_df["Date"], y=eq_df["Active_Positions"],
-                name="Aktywne Spółki w Portfelu",
-                marker_color="#38bdf8"
-            ), row=2, col=1)
-
-            # 3. Drawdown
-            fig.add_trace(go.Scatter(
-                x=eq_df["Date"], y=eq_df["Drawdown"],
-                mode="lines", name="Obsunięcie (%)",
-                line=dict(color="#ef4444", width=1.5),
-                fill="tozeroy"
-            ), row=3, col=1)
-
-            fig.update_layout(
-                height=850,
-                template="plotly_dark",
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Rozbicie wyników na poszczególne spółki z portfela
-            st.subheader("📊 Wyniki w Rozbiciu na Poszczególne Spółki Portfela")
-            sym_df = result["symbol_stats_df"]
-            if not sym_df.empty:
-                st.dataframe(sym_df, use_container_width=True)
-
-            # Pełny chronologiczny dziennik transakcji
-            st.subheader(f"📋 Chronologiczny Dziennik Wszystkich Transakcji Portfela ({len(trades_df)})")
-            if not trades_df.empty:
-                st.dataframe(trades_df, use_container_width=True)
-                csv_trades = trades_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "📥 Pobierz pełny dziennik transakcji (CSV)",
-                    data=csv_trades,
-                    file_name=f"portfolio_turtle_trades_{date.today().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.info("Brak zamkniętych transakcji w zadanym oknie czasowym.")
-
-
-# ==========================================
-# ZAKŁADKA 3: KOMPENDIUM I OPIS STRATEGII
+# ZAKŁADKA 5: KOMPENDIUM I OPIS STRATEGII
 # ==========================================
 with tab_guide:
     st.subheader("Filozofia i Zasady Żółwi (The Turtle Trading System)")
     st.markdown("""
     Eksperyment Żółwi został przeprowadzony w 1983 roku przez legendarnych inwestorów **Richarda Dennisa** i **Williama Eckhardta**, aby udowodnić, że skutecznego tradingu można nauczyć każdego za pomocą ścisłych, algorytmicznych reguł.
 
-    ### 1. Kanał Donchiana (Donchian Breakout)
-    * **System 1 (Klasyczny):**
-      - **Kupno (Wejście):** Zamknięcie świecy dziennej powyżej najwyższego maksimum z ostatnich **20 dni**.
-      - **Sprzedaż (Wyjście):** Zamknięcie świecy dziennej poniżej najniższego minimum z ostatnich **10 dni**.
-    * **Własna modyfikacja:** Możesz dowolnie testować dłuższe trendy (np. wejście 55 dni, wyjście 20 dni).
+    ### 1. Rozłączny Model Portfela i Rynku
+    * **Spółki poza portfelem (Rynek):** Skanujemy wyłącznie pod kątem **świeżego wybicia 20-dniowego szczytu**. Nie ma sensu badać dla nich dołków ani sygnałów sprzedaży, dopóki nie są w portfelu.
+    * **Spółki w portfelu:** Gdy spółka zostanie kupiona, nie czekamy na nowe wybicia 20-dniowe. Obserwujemy ją wyłącznie pod kątem:
+      - **Dokupienia (+0.5 N)**,
+      - **Stop Lossa (2x N)**,
+      - **Wyjścia z trendu (przebicie dołka 10-dniowego)**.
 
-    ### 2. Zmienność i Wskaźnik ATR (N)
-    * Zmienność rynku mierzona jest wskaźnikiem **ATR (Average True Range)** z okresu 20 dni, oznaczanym w systemie jako **$N$**.
-    * Prawdziwy zasięg (*True Range*):
-      $$\\text{TR} = \\max(H - L, |H - C_{\\text{prev}}|, |L - C_{\\text{prev}}|)$$
-    * ATR normalizuje zmienność pomiędzy różnymi spółkami (np. Orlen vs CD Projekt).
+    ### 2. Dokupowanie (Piramidowanie – Pyramiding Units)
+    * Wejście w trend następuje 1 jednostką (*Unit*).
+    * Jeśli rynek porusza się w dobrą stronę, dokupujemy kolejną 1 jednostkę za każdym razem, gdy kurs wzrośnie o **$+0.5 \\times N$** powyżej ceny ostatniego zakupu (maksymalnie do 4 jednostek).
+    * Każde dokupienie podnosi Stop Loss dla WSZYSTKICH jednostek:
+      $$\\text{Stop Loss} = \\text{Cena Ostatniego Zakupu} - 2 \\times N$$
 
-    ### 3. Dobór Wielkości Pozycji (Turtle Unit Sizing)
-    * Każda pozycja ryzykować może dokładnie **1% kapitału** (lub inną wartość zdefiniowaną w panelu bocznym).
-    * Liczba kupowanych akcji (*Unit Size*):
-      $$\\text{Unit Size} = \\left\\lfloor \\frac{\\text{Kapitał} \\times \\text{Ryzyko (\\%)}}{\\text{ATR}} \\right\\rfloor$$
-    * **Twardy Stop Loss:** Zgodnie z regułami Żółwi, obronne zlecenie stop loss ustawiane jest na poziomie **$2 \\times N$ (2 ATR)** poniżej ceny wejścia.
-
-    ### 4. Filtr Płynności na GPW
-    * Rynek polski posiada mniejszą płynność niż rynek amerykański, dlatego domyślny filtr **100 000 PLN średniego obrotu z 60 sesji** chroni przed spółkami groszowymi oraz ryzykiem braku płynności przy zamykaniu pozycji.
+    ### 3. Dobór Wielkości Jednostki (Unit Size)
+    * Każda pojedyncza jednostka ryzykuje dokładnie **1% kapitału**:
+      $$\\text{Unit Size} = \\left\\lfloor \\frac{\\text{Kapitał} \\times 1\\%}{\\text{ATR}} \\right\\rfloor$$
     """)
