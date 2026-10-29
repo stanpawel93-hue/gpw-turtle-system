@@ -38,8 +38,8 @@ def calculate_indicators(df: pd.DataFrame, entry_period: int, exit_period: int, 
 
 
 def calculate_unit_size(capital: float, risk_pct: float, atr: float, price: float) -> int:
-    """Kalkulacja liczby akcji wg wzoru Żółwi (1% ryzyka kapitału)."""
-    if atr <= 0 or price <= 0:
+    """Kalkulacja liczby akcji wg tradycyjnego wzoru Żółwi: 1 Unit = floor((Kapitał * 1%) / ATR)."""
+    if atr <= 0 or price <= 0 or capital <= 0:
         return 0
     cash_at_risk = capital * (risk_pct / 100.0)
     raw_units = int(np.floor(cash_at_risk / atr))
@@ -51,7 +51,7 @@ def run_scanner(min_turnover: float = 100000, turnover_days: int = 60,
                 capital: float = 100000, risk_pct: float = 1.0):
     """
     Skanuje spółki pod kątem dwóch wariantów strategii:
-    1. System 1 (Klasyczny): 20 dni wejście / 10 dni wyjście
+    1. System 1 (Klasyczny): 20 dni wejście / 10 dni wyjście (wejście na Otwarcie T+1)
     2. System 2 (Długoterminowy / Własny): 55 dni wejście / 20 dni wyjście
     """
     tickers = get_ticker_list()
@@ -85,14 +85,14 @@ def run_scanner(min_turnover: float = 100000, turnover_days: int = 60,
             atr = float(last_c["ATR"])
             c_high = float(last_c["Donchian_High"])
             c_low = float(last_c["Donchian_Low"])
-            unit = calculate_unit_size(capital, risk_pct, atr, close)
             sl = round(close - 2.0 * atr, 2)
+            unit = calculate_unit_size(capital, risk_pct, atr, close)
 
             if close > c_high:
                 classic_signals.append({
                     "symbol": symbol,
                     "name": info["name"],
-                    "action": "KUPUJ (Breakout)",
+                    "action": "KUPUJ na Otwarcie (Open T+1)",
                     "price": round(close, 2),
                     "channel": round(c_high, 2),
                     "atr": round(atr, 2),
